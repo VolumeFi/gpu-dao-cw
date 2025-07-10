@@ -1,9 +1,13 @@
+#[allow(unused_imports)]
+use crate::state::{ChainSetting, State, VestingInfo};
 use cosmwasm_schema::{cw_serde, QueryResponses};
-use cosmwasm_std::{Addr, Binary, CustomMsg, Uint128, Uint256};
+use cosmwasm_std::{Addr, Binary, CustomMsg, Decimal, Uint128, Uint256};
 
 #[cw_serde]
 pub struct InstantiateMsg {
     pub pusd_denom: String,
+    pub governance: String,
+    pub palomadex_factory: String,
     pub owners: Vec<String>,
 }
 
@@ -22,10 +26,17 @@ pub enum ExecuteMsg {
         distribute_amount: Uint128,
         pusd_amount: Uint128,
     },
+    SetBridge {
+        erc20_address: String,
+        chain_reference_id: String,
+    },
     Claim {
         purchaser: String,
     },
-    Refund {},
+    Refund {
+        chain_id: String,
+        purchaser: String,
+    },
     SetPaloma {
         chain_id: String,
     },
@@ -49,7 +60,7 @@ pub enum ExecuteMsg {
 
 #[cw_serde]
 pub enum ExternalExecuteMsg {
-    /// CreatePair instantiates a new pair contract.
+    /// Palomadex Factory messages
     CreatePair {
         /// The pair type (exposed in [`PairType`])
         pair_type: PairType,
@@ -58,6 +69,49 @@ pub enum ExternalExecuteMsg {
         /// Optional binary serialised parameters for custom pool types
         init_params: Option<Binary>,
     },
+
+    /// Palomadex Pair messages
+    ProvideLiquidity {
+        /// The assets available in the pool
+        assets: Vec<Asset>,
+        /// The slippage tolerance that allows liquidity provision only if the price in the pool doesn't move too much
+        slippage_tolerance: Option<Decimal>,
+        /// The receiver of LP tokens
+        receiver: Option<String>,
+    },
+}
+
+/// This enum describes a Terra asset (native or CW20).
+#[cw_serde]
+pub struct Asset {
+    /// Information about an asset stored in a [`AssetInfo`] struct
+    pub info: AssetInfo,
+    /// A token amount
+    pub amount: Uint128,
+}
+
+#[cw_serde]
+#[derive(QueryResponses)]
+pub enum ExternalQueryMsg {
+    // PalomadexFactory queries
+    #[returns(PairInfo)]
+    Pair {
+        /// The assets for which we return a pair
+        asset_infos: Vec<AssetInfo>,
+    },
+}
+
+/// This structure stores the main parameters for an palomadex pair
+#[cw_serde]
+pub struct PairInfo {
+    /// Asset information for the assets in the pool
+    pub asset_infos: Vec<AssetInfo>,
+    /// Pair contract address
+    pub contract_addr: Addr,
+    /// Pair LP token address
+    pub liquidity_token: Addr,
+    /// The pool type (xyk, stableswap etc) available in [`PairType`]
+    pub pair_type: PairType,
 }
 
 #[derive(Eq)]
@@ -83,16 +137,15 @@ pub enum AssetInfo {
 #[cw_serde]
 pub enum PalomaMsg {
     /// Message struct for cross-chain calls.
-    SchedulerMsg {
-        execute_job: ExecuteJob,
-    },
+    SchedulerMsg { execute_job: ExecuteJob },
     /// Message struct for tokenfactory calls.
     TokenFactoryMsg {
         create_denom: Option<CreateDenomMsg>,
         mint_tokens: Option<MintMsg>,
     },
     SkywayMsg {
-        set_erc20_to_denom: SetErc20ToDenom,
+        set_erc20_to_denom: Option<SetErc20ToDenom>,
+        send_tx: Option<SendTx>,
     },
 }
 
@@ -139,8 +192,26 @@ pub struct SetErc20ToDenom {
     pub chain_reference_id: String,
 }
 
+#[cw_serde]
+pub struct SendTx {
+    pub remote_chain_destination_address: String,
+    pub amount: String,
+    pub chain_reference_id: String,
+}
+
 impl CustomMsg for PalomaMsg {}
 
 #[cw_serde]
 #[derive(QueryResponses)]
-pub enum QueryMsg {}
+pub enum QueryMsg {
+    /// Query the current state of the contract
+    #[returns(State)]
+    State {},
+
+    /// Query the purchase list for a specific purchaser
+    #[returns(VestingInfo)]
+    PurchaseList { purchaser: String },
+
+    #[returns(ChainSetting)]
+    ChainSettings { chain_id: String },
+}

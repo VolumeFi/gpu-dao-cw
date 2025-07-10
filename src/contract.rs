@@ -1,13 +1,17 @@
 #[cfg(not(feature = "library"))]
 use cosmwasm_std::entry_point;
 use cosmwasm_std::{
-    to_json_binary, Binary, Deps, DepsMut, Env, MessageInfo, Response, StdResult, Uint128,
+    attr, from_json, to_json_binary, BankMsg, Binary, Coin, CosmosMsg, Deps, DepsMut, Env,
+    MessageInfo, Reply, Response, StdResult, SubMsgResult, Uint128, WasmMsg,
 };
 use cw2::set_contract_version;
 
 use crate::error::ContractError;
-use crate::msg::{ExecuteMsg, InstantiateMsg, PalomaMsg, QueryMsg};
-use crate::state::{State, STATE};
+use crate::msg::{
+    Asset, AssetInfo, ExecuteMsg, ExternalExecuteMsg, ExternalQueryMsg, InstantiateMsg, PairInfo,
+    PalomaMsg, QueryMsg,
+};
+use crate::state::{State, CHAIN_SETTINGS, PURCHASE_LIST, STATE};
 
 // version info for migration info
 const CONTRACT_NAME: &str = "crates.io:gpu-dao-cw";
@@ -23,6 +27,7 @@ pub fn instantiate(
 ) -> Result<Response, ContractError> {
     let mut state = State {
         pusd_denom: msg.pusd_denom,
+        palomadex_factory: msg.palomadex_factory,
         owners: msg
             .owners
             .iter()
@@ -30,15 +35,19 @@ pub fn instantiate(
             .collect(),
         finished: false,
         total_supply: Uint128::zero(),
+        gpu_dao_denom: None,
+        governance: deps.api.addr_validate(&msg.governance).unwrap(),
+        distribute_amount: None,
+        finalize_timestamp: None,
     };
 
     if !state
         .owners
-        .contains(&deps.api.addr_validate(&info.sender.to_string()).unwrap())
+        .contains(&deps.api.addr_validate(info.sender.as_ref()).unwrap())
     {
         state
             .owners
-            .push(deps.api.addr_validate(&info.sender.to_string()).unwrap());
+            .push(deps.api.addr_validate(info.sender.as_ref()).unwrap());
     }
 
     STATE.save(deps.storage, &state)?;
@@ -77,8 +86,15 @@ pub fn execute(
             distribute_amount,
             pusd_amount,
         ),
+        ExecuteMsg::SetBridge {
+            erc20_address,
+            chain_reference_id,
+        } => execute::set_bridge(deps, info, erc20_address, chain_reference_id),
         ExecuteMsg::Claim { purchaser } => execute::claim(deps, env, info, purchaser),
-        ExecuteMsg::Refund {} => execute::refund(deps),
+        ExecuteMsg::Refund {
+            chain_id,
+            purchaser,
+        } => execute::refund(deps, info, chain_id, purchaser),
         ExecuteMsg::SetPaloma { chain_id } => execute::set_paloma(deps, info, chain_id),
         ExecuteMsg::UpdateRefundWallet {
             chain_id,
@@ -109,9 +125,9 @@ pub mod execute {
     use crate::{
         msg::{
             AssetInfo, CreateDenomMsg, DenomUnit, ExecuteJob, ExternalExecuteMsg, Metadata,
-            MintMsg, PairType, PalomaMsg,
+            MintMsg, PairType, PalomaMsg, SendTx, SetErc20ToDenom,
         },
-        state::{CHAIN_SETTINGS, PURCHASE_LIST},
+        state::{VestingInfo, CHAIN_SETTINGS, PURCHASE_LIST, VESTING_PERIOD},
     };
     use std::str::FromStr;
 
@@ -121,23 +137,33 @@ pub mod execute {
         purchaser: String,
         amount: Uint128,
     ) -> Result<Response<PalomaMsg>, ContractError> {
-        let state = STATE.load(deps.storage)?;
+        let mut state = STATE.load(deps.storage)?;
         assert!(
             state.owners.iter().any(|x| x == info.sender),
             "Unauthorized"
         );
-        assert!(
-            state.finished == false,
-            "The contract has already been finalized"
-        );
+        assert!(!state.finished, "The contract has already been finalized");
 
-        PURCHASE_LIST.update(deps.storage, purchaser, |old| -> StdResult<_> {
-            Ok(old.unwrap_or_default() + amount)
+        state.total_supply += amount;
+        STATE.save(deps.storage, &state)?;
+
+        let purchaser = deps.api.addr_validate(&purchaser)?;
+
+        PURCHASE_LIST.update(deps.storage, purchaser.to_string(), |old| -> StdResult<_> {
+            Ok(VestingInfo {
+                last_timestamp: 0,
+                amount: if let Some(old) = old {
+                    old.amount + amount
+                } else {
+                    amount
+                },
+            })
         })?;
 
         Ok(Response::new().add_attribute("action", "purchase"))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn finalize(
         deps: DepsMut,
         env: Env,
@@ -155,10 +181,7 @@ pub mod execute {
             state.owners.iter().any(|x| x == info.sender),
             "Unauthorized"
         );
-        assert!(
-            state.finished == false,
-            "The contract has already been finalized"
-        );
+        assert!(!state.finished, "The contract has already been finalized");
         let denom_creator = env.contract.address.to_string();
         let subdenom = token_symbol.to_string();
         let denom = "factory/".to_string() + denom_creator.as_str() + "/" + subdenom.as_str();
@@ -198,33 +221,65 @@ pub mod execute {
                 }),
             }),
         ];
+        let payload = to_json_binary(&(denom.clone(), distribute_amount, pusd_amount))?;
         let submessage = SubMsg {
             id: CREATE_AMM_PAIR_REPLY_ID,
-            msg: WasmMsg::Execute {
+            msg: CosmosMsg::Wasm(WasmMsg::Execute {
                 contract_addr: palomadex_amm_factory,
                 msg: to_json_binary(&ExternalExecuteMsg::CreatePair {
                     pair_type: PairType::Xyk {},
                     asset_infos: vec![
-                        AssetInfo::NativeToken { denom },
                         AssetInfo::NativeToken {
-                            denom: state.pusd_denom,
+                            denom: denom.clone(),
+                        },
+                        AssetInfo::NativeToken {
+                            denom: state.pusd_denom.clone(),
                         },
                     ],
                     init_params: None,
                 })?,
                 funds: vec![],
-            }
-            .into(),
+            }),
             gas_limit: None,
             reply_on: ReplyOn::Success,
-            payload: todo!(),
+            payload,
         };
         state.finished = true;
+        state.finalize_timestamp = Some(env.block.time.seconds());
+        state.gpu_dao_denom = Some(denom.clone());
+        state.distribute_amount = Some(distribute_amount);
         STATE.save(deps.storage, &state)?;
         Ok(Response::new()
             .add_messages(messages)
             .add_submessage(submessage)
             .add_attribute("action", "finalize"))
+    }
+
+    pub fn set_bridge(
+        deps: DepsMut,
+        info: MessageInfo,
+        erc20_address: String,
+        chain_reference_id: String,
+    ) -> Result<Response<PalomaMsg>, ContractError> {
+        let state = STATE.load(deps.storage)?;
+        assert!(
+            state.owners.iter().any(|x| x == info.sender),
+            "Unauthorized"
+        );
+        assert!(
+            state.gpu_dao_denom.is_some(),
+            "The contract has not been finalized yet"
+        );
+        Ok(Response::new()
+            .add_message(CosmosMsg::Custom(PalomaMsg::SkywayMsg {
+                set_erc20_to_denom: Some(SetErc20ToDenom {
+                    erc20_address,
+                    token_denom: state.gpu_dao_denom.unwrap(),
+                    chain_reference_id,
+                }),
+                send_tx: None,
+            }))
+            .add_attribute("action", "set_bridge"))
     }
 
     pub fn claim(
@@ -239,16 +294,86 @@ pub mod execute {
             "Unauthorized"
         );
         assert!(
-            state.finished == true,
+            state.finished && state.finalize_timestamp.is_some(),
             "The contract has not been finalized yet"
         );
-        let amount = PURCHASE_LIST.load(deps.storage, purchaser.clone())?;
-        PURCHASE_LIST.remove(deps.storage, purchaser);
-        Ok(Response::new().add_attribute("action", "claim"))
+        let mut vesting_info = PURCHASE_LIST.load(deps.storage, purchaser.clone())?;
+        assert!(vesting_info.amount > Uint128::zero(), "No tokens to claim");
+        let current_timestamp =
+            if env.block.time.seconds() < state.finalize_timestamp.unwrap() + VESTING_PERIOD {
+                env.block.time.seconds()
+            } else {
+                state.finalize_timestamp.unwrap() + VESTING_PERIOD
+            };
+
+        if vesting_info.last_timestamp == 0 {
+            vesting_info.last_timestamp = state.finalize_timestamp.unwrap();
+        }
+        let elapsed_time = current_timestamp - vesting_info.last_timestamp;
+
+        let distribute_amount = state.distribute_amount.unwrap_or_default();
+
+        let claimable_amount = if elapsed_time >= VESTING_PERIOD {
+            vesting_info.amount
+        } else {
+            vesting_info.amount * Uint128::from(elapsed_time) / Uint128::from(VESTING_PERIOD)
+        };
+        let claimable_amount = distribute_amount * claimable_amount / state.total_supply;
+        assert!(claimable_amount > Uint128::zero(), "No tokens to claim");
+        vesting_info.last_timestamp = current_timestamp;
+        PURCHASE_LIST.save(deps.storage, purchaser.clone(), &vesting_info)?;
+
+        let claim_coin = Coin {
+            denom: state.gpu_dao_denom.clone().unwrap(),
+            amount: claimable_amount,
+        };
+        let message = CosmosMsg::Custom(PalomaMsg::SkywayMsg {
+            set_erc20_to_denom: None,
+            send_tx: Some(SendTx {
+                remote_chain_destination_address: purchaser,
+                amount: claim_coin.to_string(),
+                chain_reference_id: state.gpu_dao_denom.clone().unwrap(),
+            }),
+        });
+
+        Ok(Response::new()
+            .add_message(message)
+            .add_attribute("action", "claim"))
     }
 
-    pub fn refund(deps: DepsMut) -> Result<Response<PalomaMsg>, ContractError> {
-        Ok(Response::new().add_attribute("action", "refund"))
+    pub fn refund(
+        deps: DepsMut,
+        info: MessageInfo,
+        chain_id: String,
+        purchaser: String,
+    ) -> Result<Response<PalomaMsg>, ContractError> {
+        let state = STATE.load(deps.storage)?;
+        assert!(
+            state.owners.iter().any(|x| x == info.sender),
+            "Unauthorized"
+        );
+        assert!(!state.finished, "The contract has already been finalized");
+        let vesting_info: VestingInfo = PURCHASE_LIST.load(deps.storage, purchaser.clone())?;
+        assert!(vesting_info.amount > Uint128::zero(), "No tokens to refund");
+        let refund_amount = vesting_info.amount;
+
+        let send_coin = Coin {
+            denom: state.gpu_dao_denom.clone().unwrap(),
+            amount: refund_amount,
+        };
+
+        PURCHASE_LIST.remove(deps.storage, purchaser.clone());
+
+        Ok(Response::new()
+            .add_message(CosmosMsg::Custom(PalomaMsg::SkywayMsg {
+                set_erc20_to_denom: None,
+                send_tx: Some(SendTx {
+                    remote_chain_destination_address: purchaser,
+                    amount: send_coin.to_string(),
+                    chain_reference_id: chain_id.clone(),
+                }),
+            }))
+            .add_attribute("action", "refund"))
     }
 
     pub fn set_paloma(
@@ -502,19 +627,102 @@ pub mod execute {
     }
 }
 
+/// The entry point to the contract for processing replies from submessages.
 #[cfg_attr(not(feature = "library"), entry_point)]
-pub fn query(_deps: Deps, _env: Env, _msg: QueryMsg) -> StdResult<Binary> {
-    unimplemented!()
-    // match msg {
-    //     QueryMsg::GetCount {} => to_json_binary(&query::count(deps)?),
-    // }
+pub fn reply(deps: DepsMut, env: Env, msg: Reply) -> Result<Response, ContractError> {
+    match msg {
+        Reply {
+            id: CREATE_AMM_PAIR_REPLY_ID,
+            result: SubMsgResult::Ok(..),
+            payload,
+            gas_used: _,
+        } => {
+            let state = STATE.load(deps.storage)?;
+            let (denom, distribute_amount, pusd_amount): (String, Uint128, Uint128) =
+                from_json(payload)?;
+
+            let pair_info: PairInfo = deps.querier.query_wasm_smart(
+                state.palomadex_factory.to_string(),
+                &ExternalQueryMsg::Pair {
+                    asset_infos: vec![
+                        AssetInfo::NativeToken {
+                            denom: denom.clone(),
+                        },
+                        AssetInfo::NativeToken {
+                            denom: state.pusd_denom.clone(),
+                        },
+                    ],
+                },
+            )?;
+            let pair_contract = deps.api.addr_validate(pair_info.contract_addr.as_str())?;
+            let mut gpu_dao_coin = deps
+                .querier
+                .query_balance(&env.contract.address, denom.clone())?;
+            let mut pusd_coin = deps
+                .querier
+                .query_balance(&env.contract.address, state.pusd_denom.clone())?;
+            gpu_dao_coin.amount -= distribute_amount;
+            pusd_coin.amount -= pusd_amount;
+            let funds = vec![
+                gpu_dao_coin.clone(),
+                Coin {
+                    denom: state.pusd_denom.clone(),
+                    amount: pusd_amount,
+                },
+            ];
+            let messages: Vec<CosmosMsg> = vec![
+                CosmosMsg::Bank(BankMsg::Send {
+                    to_address: state.governance.to_string(),
+                    amount: vec![pusd_coin],
+                }),
+                CosmosMsg::Wasm(WasmMsg::Execute {
+                    contract_addr: pair_contract.to_string(),
+                    msg: to_json_binary(&ExternalExecuteMsg::ProvideLiquidity {
+                        assets: vec![
+                            Asset {
+                                info: AssetInfo::NativeToken {
+                                    denom: denom.clone(),
+                                },
+                                amount: gpu_dao_coin.amount,
+                            },
+                            Asset {
+                                info: AssetInfo::NativeToken {
+                                    denom: state.pusd_denom.clone(),
+                                },
+                                amount: pusd_amount,
+                            },
+                        ],
+                        receiver: None,
+                        slippage_tolerance: None,
+                    })?,
+                    funds: funds.clone(),
+                }),
+            ];
+            Ok(Response::new().add_messages(messages).add_attributes(vec![
+                attr("action", "finalize"),
+                attr("pusd_amount", funds[0].amount.to_string()),
+                attr("token_denom", funds[1].denom.clone()),
+                attr("token_amount", funds[1].amount.to_string()),
+            ]))
+        }
+        _ => Err(ContractError::FailedToParseReply {}),
+    }
 }
 
-pub mod query {
-    // use super::*;
-
-    // pub fn count(deps: Deps) -> StdResult<GetCountResponse> {
-    //     let state = STATE.load(deps.storage)?;
-    //     Ok(GetCountResponse { count: state.count })
-    // }
+#[cfg_attr(not(feature = "library"), entry_point)]
+pub fn query(_deps: Deps, _env: Env, msg: QueryMsg) -> StdResult<Binary> {
+    match msg {
+        QueryMsg::State {} => {
+            let state = STATE.load(_deps.storage)?;
+            to_json_binary(&state)
+        }
+        QueryMsg::PurchaseList { purchaser } => {
+            let vesting_info = PURCHASE_LIST.load(_deps.storage, purchaser)?;
+            to_json_binary(&vesting_info)
+        }
+        QueryMsg::ChainSettings { chain_id } => {
+            let chain_setting = CHAIN_SETTINGS.load(_deps.storage, chain_id)?;
+            to_json_binary(&chain_setting)
+        }
+    }
 }
