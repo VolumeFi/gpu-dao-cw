@@ -11,12 +11,12 @@ jobs:
       - name: Checkout sources
         uses: actions/checkout@v2
       - name: Install cargo-run-script
-        uses: actions-rs/cargo@v1
+        uses: dtolnay/rust-toolchain@stable
         with:
           command: install
           args: cargo-run-script
       - name: Run cargo optimize
-        uses: actions-rs/cargo@v1
+        uses: dtolnay/rust-toolchain@stable
         with:
           command: run-script
           args: optimize
