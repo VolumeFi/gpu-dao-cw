@@ -95,6 +95,9 @@ pub fn execute(
             chain_id,
             purchaser,
         } => execute::refund(deps, info, chain_id, purchaser),
+        ExecuteMsg::SetChainSetting { chain_id, job_id } => {
+            execute::set_chain_setting(deps, info, chain_id, job_id)
+        }
         ExecuteMsg::SetPaloma { chain_id } => execute::set_paloma(deps, info, chain_id),
         ExecuteMsg::UpdateRefundWallet {
             chain_id,
@@ -127,7 +130,7 @@ pub mod execute {
             AssetInfo, CreateDenomMsg, DenomUnit, ExecuteJob, ExternalExecuteMsg, Metadata,
             MintMsg, PairType, PalomaMsg, SendTx, SetErc20ToDenom,
         },
-        state::{VestingInfo, CHAIN_SETTINGS, PURCHASE_LIST, VESTING_PERIOD},
+        state::{ChainSetting, VestingInfo, CHAIN_SETTINGS, PURCHASE_LIST, VESTING_PERIOD},
     };
     use std::str::FromStr;
 
@@ -297,6 +300,7 @@ pub mod execute {
             state.finished && state.finalize_timestamp.is_some(),
             "The contract has not been finalized yet"
         );
+        assert!(state.total_supply > Uint128::zero(), "No tokens to claim");
         let mut vesting_info = PURCHASE_LIST.load(deps.storage, purchaser.clone())?;
         assert!(vesting_info.amount > Uint128::zero(), "No tokens to claim");
         let current_timestamp =
@@ -376,6 +380,28 @@ pub mod execute {
             .add_attribute("action", "refund"))
     }
 
+    pub fn set_chain_setting(
+        deps: DepsMut,
+        info: MessageInfo,
+        chain_id: String,
+        job_id: String,
+    ) -> Result<Response<PalomaMsg>, ContractError> {
+        let state = STATE.load(deps.storage)?;
+        assert!(
+            state.owners.iter().any(|x| x == info.sender),
+            "Unauthorized"
+        );
+        CHAIN_SETTINGS.save(
+            deps.storage,
+            chain_id.clone(),
+            &ChainSetting {
+                job_id: job_id.clone(),
+            },
+        )?;
+
+        Ok(Response::new().add_attribute("action", "set_chain_setting"))
+    }
+
     pub fn set_paloma(
         deps: DepsMut,
         info: MessageInfo,
@@ -387,6 +413,8 @@ pub mod execute {
             state.owners.iter().any(|x| x == info.sender),
             "Unauthorized"
         );
+
+        let job_id = CHAIN_SETTINGS.load(deps.storage, chain_id.clone())?.job_id;
 
         #[allow(deprecated)]
         let contract: Contract = Contract {
@@ -409,7 +437,7 @@ pub mod execute {
         Ok(Response::new()
             .add_message(CosmosMsg::Custom(PalomaMsg::SchedulerMsg {
                 execute_job: ExecuteJob {
-                    job_id: CHAIN_SETTINGS.load(deps.storage, chain_id.clone())?.job_id,
+                    job_id,
                     payload: Binary::new(
                         contract
                             .function("set_paloma")
