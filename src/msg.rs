@@ -37,6 +37,10 @@ pub enum ExecuteMsg {
         chain_id: String,
         purchaser: String,
     },
+    SetChainSetting {
+        chain_id: String,
+        job_id: String,
+    },
     SetPaloma {
         chain_id: String,
     },
